@@ -55,4 +55,10 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		3) Take the log-softmax of the logits and return log-probabilities over all classes.
 		'''
 		# todo
-		raise NotImplementedError
+		hidden_states = self.llama(input_ids)[1]
+		last_hidden_state = hidden_states[:, -1, :]
+		dropped = self.dropout(last_hidden_state)
+		logits = self.classifier_head(dropped)
+		log_probabilities = F.log_softmax(logits, dim=-1)
+		return log_probabilities
+  

@@ -8,7 +8,24 @@ import torch.nn.functional as F
 from base_llama import LlamaPreTrainedModel, LlamaConfig
 from rope import apply_rotary_emb
 from utils import *
+def generate_causal_mask(seqlen: int, device: torch.device) -> torch.Tensor:
+    '''
+    Generate a triangular attention mask for the given sequence length. This mask
+    is used to prevent attention to future tokens in the sequence. The mask should
+    be a 2D tensor with shape (seqlen, seqlen) and should be filled with 1s and 0s,
+    where the lower triangular part of the matrix should be filled with 1s and the
+    upper triangular part should be filled with 0s.
 
+    Args:
+        seqlen (int): The length of the sequence.
+        device (torch.device): The device to create the tensor on.
+
+    Returns:
+        torch.Tensor: The attention mask tensor.
+    '''
+    mask = torch.ones(seqlen, seqlen, device=device)
+    mask = torch.tril(mask)  # lower triangular part
+    return mask
 # Root Mean Square Layer Normalization (https://arxiv.org/abs/1910.07467)
 # borrowed from the official Llama implementation:
 # https://github.com/facebookresearch/llama/blob/main/llama/model.py
@@ -43,8 +60,7 @@ class RMSNorm(torch.nn.Module):
         Returns:
             torch.Tensor: The normalized tensor.
         """
-        # todo
-        raise NotImplementedError
+        return x / torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         """
@@ -71,14 +87,13 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.dim // config.n_heads
         self.max_seq_len = config.max_seq_len
-        self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False)
-        self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False)
+        self.compute_query = nn.Linear(config.dim, config.n_heads * self.head_dim, bias=False) #q_proj
+        self.compute_key = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False) #k_proj
+        self.compute_value = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False) #v_proj
+        self.compute_output = nn.Linear(config.n_heads * self.head_dim, config.dim, bias=False) #o_proj
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-
     def compute_query_key_value_scores(self,
                                        query: torch.Tensor,
                                        key: torch.Tensor,
@@ -93,9 +108,25 @@ class Attention(nn.Module):
         Make sure to use attention_dropout (self.attn_dropout) on the computed
         attention matrix before applying it to the value tensor.
         '''
-        # todo
-        raise NotImplementedError
-
+        # we currently do not support data parallelism on multiple gpu
+        bsz, n_local_kv_heads, seqlen, head_dim = query.size()
+        # n_local_kv_heads is equal to n_local_heads, as we don't use GQA here
+        # compute the attention scores
+        #print(query.shape)
+        multihead_attn = torch.einsum('bhtd,bhTd->bhtT', query, key) / math.sqrt(head_dim)
+        #print(multihead_attn[0][0])
+        # apply the attention mask
+        attn_mask = generate_causal_mask(seqlen, multihead_attn.device)
+        #print(attn_mask)
+        attn_mask = attn_mask[None, None, :, :].expand(bsz, n_local_kv_heads, seqlen, -1)
+        #print(attn_mask.shape,multihead_attn.shape)
+        #multihead_attn = multihead_attn.masked_fill(attn_mask == 0, float('-inf'))
+        #print(multihead_attn[0][1])
+        # do the softmax
+        multihead_attn = F.softmax(multihead_attn, dim=-1, dtype=torch.float32).to(query.dtype)
+        multihead_attn = self.attn_dropout(multihead_attn)
+        output = torch.matmul(multihead_attn, value)
+        return output
     def forward(
         self,
         x: torch.Tensor
@@ -196,8 +227,13 @@ class LlamaLayer(nn.Module):
         5) add a residual connection from the unnormalized self-attention output to the
            output of the feed-forward network
         '''
-        # todo
-        raise NotImplementedError
+        normed_x = self.attention_norm(x)
+        attn_output = self.attention(normed_x)
+        attn_output = attn_output + x
+        ffn_input = self.ffn_norm(attn_output)
+        ffn_output = self.feed_forward(ffn_input)
+        ffn_output = ffn_output + attn_output
+        return ffn_output
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -273,12 +309,10 @@ class Llama(LlamaPreTrainedModel):
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
-            # todo
-            raise NotImplementedError
 
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True) # (b,1)
             else:
                 '''
                 Perform temperature sampling:
@@ -289,11 +323,10 @@ class Llama(LlamaPreTrainedModel):
 
                 Note that we are not using top-k sampling/nucleus sampling in this procedure.
                 '''
-                idx_next = None
+                probs = F.softmax(logits / temperature, dim=-1) # (b,vocab_size)
+                idx_next = torch.multinomial(probs, num_samples=1) # (b,1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-
-
         return idx
 
 def load_pretrained(checkpoint):
@@ -316,5 +349,6 @@ def load_pretrained(checkpoint):
   for k,v in list(state_dict.items()):
       if k.startswith(unwanted_prefix):
           state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-  model.load_state_dict(state_dict, strict=False)
+  keys = model.load_state_dict(state_dict, strict=False)
+  print(f"Loaded model from {checkpoint} with keys {keys}")
   return model

@@ -28,5 +28,7 @@ def test_optimizer(opt_class) -> torch.Tensor:
 
 ref = torch.tensor(np.load("optimizer_test.npy"))
 actual = test_optimizer(AdamW)
+#loss = torch.nn.functional.mse_loss(ref, actual)
+#print(f"Loss: {loss}")
 assert torch.allclose(ref, actual)
 print("Optimizer test passed!")

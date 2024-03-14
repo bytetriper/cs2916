@@ -2,8 +2,6 @@ from typing import Callable, Iterable, Tuple
 
 import torch
 from torch.optim import Optimizer
-
-
 class AdamW(Optimizer):
     def __init__(
             self,
@@ -37,24 +35,43 @@ class AdamW(Optimizer):
                 grad = p.grad.data
                 if grad.is_sparse:
                     raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
-
-                raise NotImplementedError()
-
+                grad = grad.float()
                 # State should be stored in this dictionary
                 state = self.state[p]
+                # State initialization if necessary
+                if len(state) == 0:
+                    state["step"] = (
+                        torch.tensor(0.0)
+                    )
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format,dtype=torch.float32
+                    )
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, memory_format=torch.preserve_format,dtype=torch.float32
+                    )
+                
+                # Increment the step counter
+                state["step"] += 1
 
                 # Access hyperparameters from the `group` dictionary
                 alpha = group["lr"]
 
                 # Update first and second moments of the gradients
-
+                state["exp_avg"].mul_(group["betas"][0]).add_(grad, alpha=1 - group["betas"][0])
+                state["exp_avg_sq"].mul_(group["betas"][1]).addcmul_(grad, grad, value=1 - group["betas"][1])
                 # Bias correction
+                exp_avg = state["exp_avg"] / (1 - torch.pow(group["betas"][0], state["step"]))
+                exp_avg_sq = state["exp_avg_sq"] / (1 - torch.pow(group["betas"][1], state["step"]))
                 # Please note that we are using the "efficient version" given in
                 # https://arxiv.org/abs/1412.6980
 
                 # Update parameters
+                p.data.addcdiv_(exp_avg, (exp_avg_sq.sqrt() + group["eps"]), value=-alpha)
 
                 # Add weight decay after the main gradient-based updates.
-                # Please note that the learning rate should be incorporated into this update.
-
+                # Please note that the learning rate should be incorporated into this update.   
+                if group["weight_decay"] != 0:
+                    p.data.add_(p.data, alpha=-group["weight_decay"] * alpha)
         return loss
